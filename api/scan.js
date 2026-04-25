@@ -21,8 +21,8 @@ const TRACKERS = [
     platform: "Google Ads",
     category: "Advertising",
     method: "Client-side",
-    highConfidencePatterns: ["gtag/js?id=aw-", "googleadservices.com/pagead/conversion", "conversion_async.js", "googleads.g.doubleclick.net/pagead", "pagead/1p-conversion", "_gcl_aw", "_gcl_gb"],
-    mediumConfidencePatterns: ["googleads.g.doubleclick.net", "googleadservices.com", "pagead/conversion", "aw-"]
+    highConfidencePatterns: ["gtag/js?id=aw-", "googleadservices.com/pagead/conversion", "conversion_async.js", "googleads.g.doubleclick.net/pagead", "pagead/1p-conversion", "googleads.g.doubleclick.net", "_gcl_aw", "_gcl_gb"],
+    mediumConfidencePatterns: ["googleadservices.com", "pagead/conversion", "pagead/1p-user-list", "ads/ga-audiences", "aw-"]
   },
   {
     platform: "Google Floodlight",
@@ -94,6 +94,12 @@ function unique(values) {
   return [...new Set(values.filter(Boolean))];
 }
 
+function daysUntilExpiry(expires) {
+  if (!expires || expires < 0) return null;
+  const now = Math.floor(Date.now() / 1000);
+  return Math.max(0, Math.round((expires - now) / 86400));
+}
+
 function detectTrackers(text) {
   const lower = text.toLowerCase();
 
@@ -101,7 +107,6 @@ function detectTrackers(text) {
     const highEvidence = tracker.highConfidencePatterns.filter((pattern) =>
       lower.includes(pattern.toLowerCase())
     );
-
     const mediumEvidence = tracker.mediumConfidencePatterns.filter((pattern) =>
       lower.includes(pattern.toLowerCase())
     );
@@ -120,7 +125,32 @@ function detectTrackers(text) {
   });
 }
 
-function calculateScore(foundTrackers, serverSideDetected) {
+function analyzeCookieRisk(cookiesDetected) {
+  const marketingCookies = cookiesDetected.filter((c) => /^(?:_gcl|_fbp|_fbc|li_|_uet|uetsid|uetvid|ttclid|_ttp|sc|sc_at)/i.test(c.name || ""));
+  const shortLifetimeCookies = marketingCookies.filter((c) => typeof c.lifetime_days === "number" && c.lifetime_days > 0 && c.lifetime_days <= 30);
+
+  return {
+    marketing_cookies_count: marketingCookies.length,
+    short_lifetime_cookies_count: shortLifetimeCookies.length,
+    short_lifetime_cookies: shortLifetimeCookies.map((c) => ({ name: c.name, lifetime_days: c.lifetime_days, domain: c.domain })),
+    cookie_lifetime_risk: shortLifetimeCookies.length ? "High" : marketingCookies.length ? "Medium" : "Unknown"
+  };
+}
+
+function estimateRisks(foundTrackers, serverSideDetected, cookieRisk) {
+  const clientSideTrackers = foundTrackers.filter((t) => t.method.toLowerCase().includes("client"));
+  return {
+    client_side_trackers_count: clientSideTrackers.length,
+    server_side_detected: serverSideDetected,
+    adblocker_risk: clientSideTrackers.length > 0 && !serverSideDetected ? "High" : "Medium",
+    itp_risk: !serverSideDetected ? "High" : "Medium",
+    cookie_lifetime_risk: cookieRisk.cookie_lifetime_risk,
+    attribution_loss_risk: clientSideTrackers.length >= 3 && !serverSideDetected ? "High" : "Medium",
+    recommendation: "Move high-value conversions to server-side tracking and preserve first-party identifiers, UTMs, and click IDs."
+  };
+}
+
+function calculateScore(foundTrackers, serverSideDetected, cookieRisk) {
   let score = 12;
 
   if (foundTrackers.length >= 1) score += 8;
@@ -133,11 +163,12 @@ function calculateScore(foundTrackers, serverSideDetected) {
   if (foundTrackers.some((t) => t.platform.includes("Kepixel"))) score += 10;
   if (serverSideDetected) score += 15;
   if (!serverSideDetected) score -= 8;
+  if (cookieRisk.cookie_lifetime_risk === "High") score -= 7;
 
   return Math.max(0, Math.min(100, score));
 }
 
-function getRecommendations(foundTrackers, serverSideDetected) {
+function getRecommendations(foundTrackers, serverSideDetected, cookieRisk) {
   const recommendations = [];
 
   if (!foundTrackers.some((t) => t.platform.includes("Google Tag Manager"))) {
@@ -154,6 +185,10 @@ function getRecommendations(foundTrackers, serverSideDetected) {
 
   if (!foundTrackers.some((t) => t.platform.includes("Meta"))) {
     recommendations.push("Meta Pixel was not publicly detected. Add Pixel + CAPI if Meta Ads are used.");
+  }
+
+  if (cookieRisk.cookie_lifetime_risk === "High") {
+    recommendations.push("Marketing cookies with short lifetime were detected. Improve first-party cookie durability and preserve click IDs/UTMs through a server-side layer.");
   }
 
   if (!serverSideDetected) {
@@ -204,6 +239,7 @@ async function scanWithBrowser(targetUrl) {
     const requests = [];
     const responses = [];
     const failedRequests = [];
+    const resourceTiming = [];
 
     page.on("request", (request) => requests.push(request.url()));
     page.on("response", (response) => responses.push(response.url()));
@@ -214,7 +250,6 @@ async function scanWithBrowser(targetUrl) {
     await safeClickConsent(page);
     await new Promise((resolve) => setTimeout(resolve, 8000));
 
-    // Try lightweight interaction to trigger lazy-loaded tags.
     try {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
       await new Promise((resolve) => setTimeout(resolve, 1500));
@@ -230,6 +265,14 @@ async function scanWithBrowser(targetUrl) {
     const cookies = await page.cookies();
 
     const browserSignals = await page.evaluate(() => {
+      const resources = performance.getEntriesByType("resource").map((entry) => ({
+        name: entry.name,
+        initiatorType: entry.initiatorType,
+        duration: Math.round(entry.duration || 0),
+        transferSize: entry.transferSize || 0,
+        encodedBodySize: entry.encodedBodySize || 0
+      }));
+
       return {
         hasDataLayer: Array.isArray(window.dataLayer),
         dataLayerLength: Array.isArray(window.dataLayer) ? window.dataLayer.length : 0,
@@ -239,11 +282,15 @@ async function scanWithBrowser(targetUrl) {
         hasSnaptr: typeof window.snaptr === "function",
         hasUetq: Array.isArray(window.uetq),
         hasHj: typeof window.hj === "function",
-        dataLayerPreview: Array.isArray(window.dataLayer) ? JSON.stringify(window.dataLayer).slice(0, 2000) : ""
+        dataLayerPreview: Array.isArray(window.dataLayer) ? JSON.stringify(window.dataLayer).slice(0, 2000) : "",
+        resources
       };
     });
 
-    return { html, scripts, cookies, requests, responses, failedRequests, browserSignals };
+    resourceTiming.push(...(browserSignals.resources || []));
+    delete browserSignals.resources;
+
+    return { html, scripts, cookies, requests, responses, failedRequests, resourceTiming, browserSignals };
   } finally {
     await browser.close();
   }
@@ -251,7 +298,7 @@ async function scanWithBrowser(targetUrl) {
 
 async function scanWithFetch(targetUrl) {
   const response = await fetch(targetUrl, {
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; KepixelTrackingScanner/2.1; +https://kepixel.com)" }
+    headers: { "User-Agent": "Mozilla/5.0 (compatible; KepixelTrackingScanner/2.2; +https://kepixel.com)" }
   });
 
   const html = await response.text();
@@ -266,7 +313,7 @@ async function scanWithFetch(targetUrl) {
     ? rawCookie.split(/,(?=\s*[^;]+=)/).map((cookie) => {
         const [nameValue] = cookie.split(";");
         const [name, value] = nameValue.split("=");
-        return { name: name?.trim(), value: value ? value.slice(0, 20) : "", domain: "response-header" };
+        return { name: name?.trim(), value: value ? value.slice(0, 20) : "", domain: "response-header", expires: null };
       })
     : [];
 
@@ -277,6 +324,7 @@ async function scanWithFetch(targetUrl) {
     requests: [],
     responses: [],
     failedRequests: [],
+    resourceTiming: [],
     browserSignals: {
       hasDataLayer: false,
       dataLayerLength: 0,
@@ -317,10 +365,11 @@ export default async function handler(req, res) {
     const scriptsText = scan.scripts.map((s) => `${s.src}\n${s.inline_preview}`).join("\n");
     const cookiesText = scan.cookies.map((c) => `${c.name}=${c.value || c.value_preview || ""};${c.domain || ""}`).join("\n");
     const networkText = [...scan.requests, ...scan.responses].join("\n");
+    const resourceText = (scan.resourceTiming || []).map((r) => `${r.name} ${r.initiatorType} ${r.transferSize} ${r.duration}`).join("\n");
     const failedText = (scan.failedRequests || []).map((r) => `${r.url} ${r.failure}`).join("\n");
     const browserSignalsText = JSON.stringify(scan.browserSignals || {});
 
-    const combinedText = [scan.html, scriptsText, cookiesText, networkText, failedText, browserSignalsText].join("\n");
+    const combinedText = [scan.html, scriptsText, cookiesText, networkText, resourceText, failedText, browserSignalsText].join("\n");
 
     const trackerResults = detectTrackers(combinedText);
     const foundTrackers = trackerResults.filter((t) => t.status === "Found");
@@ -329,16 +378,33 @@ export default async function handler(req, res) {
     const networkRequestsDetected = unique([...scan.requests, ...scan.responses].filter((url) => SCRIPT_REGEX.test(url))).slice(0, 200);
     const failedTrackingRequests = unique((scan.failedRequests || []).map((r) => r.url).filter((url) => SCRIPT_REGEX.test(url))).slice(0, 50);
 
+    const trackingResources = (scan.resourceTiming || [])
+      .filter((r) => SCRIPT_REGEX.test(r.name))
+      .map((r) => ({
+        url: r.name,
+        initiator_type: r.initiatorType,
+        transfer_size_bytes: r.transferSize,
+        duration_ms: r.duration
+      }))
+      .slice(0, 100);
+
     const cookiesDetected = scan.cookies
       .filter((c) => COOKIE_REGEX.test(c.name || ""))
-      .map((c) => ({ name: c.name, domain: c.domain || "", expires: c.expires || null }));
+      .map((c) => ({
+        name: c.name,
+        domain: c.domain || "",
+        expires: c.expires || null,
+        lifetime_days: daysUntilExpiry(c.expires)
+      }));
 
     const serverSideDetected = false;
-    const score = calculateScore(foundTrackers, serverSideDetected);
+    const cookieRisk = analyzeCookieRisk(cookiesDetected);
+    const riskAssessment = estimateRisks(foundTrackers, serverSideDetected, cookieRisk);
+    const score = calculateScore(foundTrackers, serverSideDetected, cookieRisk);
 
     return res.status(200).json({
       url: targetUrl,
-      scanner_version: "2.1-browser-rendering-enhanced",
+      scanner_version: "2.2-risk-scoring-cookie-lifetime",
       scan_mode: scanMode,
       overall_score: score,
       tracking_health: score >= 70 ? "Good" : score >= 45 ? "Needs Fix" : "Poor",
@@ -347,14 +413,14 @@ export default async function handler(req, res) {
       scripts_detected: scriptsDetected,
       network_requests_detected: networkRequestsDetected,
       failed_tracking_requests: failedTrackingRequests,
+      tracking_resources,
       cookies_detected: cookiesDetected,
+      cookie_risk: cookieRisk,
+      risk_assessment: riskAssessment,
       browser_signals: scan.browserSignals,
       server_side_detected: serverSideDetected,
       server_side_note: "Server-side tracking and CAPI usually cannot be verified from a public browser scan.",
-      adblocker_risk: true,
-      itp_risk: true,
-      page_speed_score: null,
-      recommendations: getRecommendations(foundTrackers, serverSideDetected),
+      recommendations: getRecommendations(foundTrackers, serverSideDetected, cookieRisk),
       browser_error: scan.browser_error || null
     });
   } catch (error) {
